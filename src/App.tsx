@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react'
 import { bitable, IFieldMeta } from '@lark-base-open/js-sdk'
+import * as XLSX from 'xlsx'
+import ExcelJS from 'exceljs'
 import './App.css'
+
+const ATTACHMENT_FIELD_TYPE = 17
 
 function App() {
   const [tableName, setTableName] = useState<string>('Loading...')
@@ -11,7 +15,7 @@ function App() {
   
   const [fields, setFields] = useState<IFieldMeta[]>([])
   const [selectedFieldIds, setSelectedFieldIds] = useState<string[]>([])
-  const [exportFormat, setExportFormat] = useState<'csv' | 'json'>('csv')
+  const [exportFormat, setExportFormat] = useState<'csv' | 'json' | 'xlsx'>('csv')
 
   useEffect(() => {
     const fetchData = async () => {
@@ -216,6 +220,153 @@ function App() {
     return JSON.stringify(data, null, 2)
   }
 
+  const arrayBufferToBase64 = (buffer: Uint8Array): string => {
+    let binary = ''
+    const len = buffer.byteLength
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(buffer[i])
+    }
+    return btoa(binary)
+  }
+
+  const exportToExcelJS = async (): Promise<{
+    data: any[][];
+    images: { row: number; col: number; base64: string; extension: string; cellRef: string }[]
+  }> => {
+    const table = await bitable.base.getActiveTable()
+    const activeView = await table.getActiveView()
+
+    const selectedFields = fields.filter(f => selectedFieldIds.includes(f.id))
+
+    const visibleRecordIds = await activeView.getVisibleRecordIdList()
+    const recordIds = visibleRecordIds.filter(id => id) as string[]
+
+    const fieldObjects = await Promise.all(
+      selectedFields.map(async (field) => ({
+        id: field.id,
+        name: field.name,
+        field: await table.getField(field.id),
+        type: field.type
+      }))
+    )
+
+    const attachmentFieldIds = fieldObjects.filter(f => f.type === ATTACHMENT_FIELD_TYPE).map(f => f.id)
+
+    const data: any[][] = []
+    data.push(selectedFields.map(f => f.name))
+
+    const images: { row: number; col: number; base64: string; extension: string; cellRef: string }[] = []
+
+    const batchSize = 20
+    for (let i = 0; i < recordIds.length; i += batchSize) {
+      const batchRecordIds = recordIds.slice(i, i + batchSize)
+      const batchPromises = batchRecordIds.map(async (recordId, batchIndex) => {
+        const rowIndex = i + batchIndex + 2
+        const row: (string | number | null)[] = []
+
+        for (let colIndex = 0; colIndex < fieldObjects.length; colIndex++) {
+          const f = fieldObjects[colIndex]
+          try {
+            const value = await f.field.getValue(recordId)
+            addLog(`字段[${f.name}]类型=${f.type}, 值=${JSON.stringify(value)?.slice(0, 100)}`, 'info')
+            if (f.type === ATTACHMENT_FIELD_TYPE) {
+              if (!value || !Array.isArray(value) || value.length === 0) {
+                row.push('')
+                continue
+              }
+              addLog(`检测到附件字段: ${f.name}, 附件数量=${value.length}`, 'info')
+              const attachmentNames: string[] = []
+
+              let urlsArray: string[] = []
+              try {
+                const attField = await table.getField(f.id)
+                if (attField && 'getAttachmentUrls' in attField) {
+                  const savedUrls = await (attField as any).getAttachmentUrls(recordId)
+                  if (savedUrls) {
+                    if (typeof savedUrls === 'string') {
+                      try {
+                        urlsArray = JSON.parse(savedUrls)
+                      } catch (e) {}
+                    } else if (Array.isArray(savedUrls)) {
+                      urlsArray = savedUrls
+                    }
+                    addLog(`获取附件URLs成功`, 'info')
+                  }
+                }
+              } catch (e) {
+                addLog(`获取附件URL失败: ${e}`, 'error')
+              }
+
+              for (let attIdx = 0; attIdx < value.length; attIdx++) {
+                const attachment = value[attIdx]
+                if (attachment && attachment.token) {
+                  let downloadUrl = `https://open.feishu.cn/open-apis/drive/v1/medias/${attachment.token}/download`
+                  if (urlsArray && urlsArray[attIdx]) {
+                    downloadUrl = urlsArray[attIdx]
+                  }
+                  try {
+                    const response = await fetch(downloadUrl)
+                    if (response.ok) {
+                      const fileData = await response.arrayBuffer()
+                      const mediaType = attachment.type || 'application/octet-stream'
+                      const attName = attachment.name || `附件${attIdx + 1}`
+                      attachmentNames.push(attName)
+                      addLog(`附件下载成功: ${attName}, 类型=${mediaType}`, 'info')
+
+                      if (mediaType.startsWith('image/')) {
+                        const uint8Array = new Uint8Array(fileData)
+                        const base64Str = arrayBufferToBase64(uint8Array)
+                        const ext = mediaType.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+                        const colLetter = XLSX.utils.encode_col(colIndex)
+                        const cellRef = `${colLetter}${rowIndex}`
+                        images.push({
+                          row: rowIndex,
+                          col: colIndex,
+                          base64: base64Str,
+                          extension: ext,
+                          cellRef: cellRef
+                        })
+                        addLog(`图片已添加到列表: ${attName}`, 'info')
+                      }
+                    } else {
+                      addLog(`附件下载失败: ${response.status}`, 'error')
+                    }
+                  } catch (fetchErr) {
+                    addLog(`附件下载异常: ${fetchErr}`, 'error')
+                  }
+                }
+              }
+
+              if (attachmentNames.length > 0) {
+                row.push(`[附件: ${attachmentNames.join('; ')}]`)
+              } else {
+                row.push('')
+              }
+            } else {
+              row.push(formatCellValue(f.type, value))
+            }
+          } catch (err) {
+            addLog(`处理字段[${f.name}]出错: ${err}`, 'error')
+            row.push('')
+          }
+        }
+        return row
+      })
+      const batchResults = await Promise.all(batchPromises)
+      data.push(...batchResults)
+      addLog(`已处理 ${Math.min(i + batchSize, recordIds.length)}/${recordIds.length} 条记录`, 'info')
+    }
+
+    const ws = XLSX.utils.aoa_to_sheet(data)
+
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, '数据')
+
+    addLog(`共收集到 ${images.length} 个图片`, 'info')
+
+    return { data, images }
+  }
+
   const handleExport = async () => {
     if (selectedFieldIds.length === 0) {
       setStatusMsg('请至少选择一个字段')
@@ -227,7 +378,7 @@ function App() {
     setLogs([])
 
     try {
-      let content: string
+      let content: string | ArrayBuffer
       let fileName: string
       let mimeType: string
 
@@ -235,19 +386,60 @@ function App() {
         content = await exportToCSV()
         fileName = `${tableName}_${new Date().toISOString().slice(0, 10)}.csv`
         mimeType = 'text/csv;charset=utf-8'
-      } else {
+        const blob = new Blob([content], { type: mimeType })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = fileName
+        link.click()
+        URL.revokeObjectURL(url)
+      } else if (exportFormat === 'json') {
         content = await exportToJSON()
         fileName = `${tableName}_${new Date().toISOString().slice(0, 10)}.json`
         mimeType = 'application/json'
-      }
+        const blob = new Blob([content], { type: mimeType })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = fileName
+        link.click()
+        URL.revokeObjectURL(url)
+      } else {
+        const { data, images } = await exportToExcelJS()
 
-      const blob = new Blob([content], { type: mimeType })
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = fileName
-      link.click()
-      URL.revokeObjectURL(url)
+        const workbook = new ExcelJS.Workbook()
+        const worksheet = workbook.addWorksheet('数据')
+
+        worksheet.addRows(data)
+
+        for (const img of images) {
+          addLog(`处理图片: cellRef=${img.cellRef}, ext=${img.extension}, base64长度=${img.base64.length}`, 'info')
+          try {
+            const imageId = workbook.addImage({
+              base64: img.base64,
+              extension: img.extension as 'png' | 'jpeg' | 'gif'
+            })
+            addLog(`图片ID: ${imageId}`, 'info')
+
+            const colLetter = XLSX.utils.encode_col(img.col)
+            worksheet.addImage(imageId, `${colLetter}${img.row}:${colLetter}${img.row}`)
+            worksheet.getRow(img.row).height = 100
+            addLog(`图片已添加到${colLetter}${img.row}`, 'info')
+          } catch (imgErr) {
+            addLog(`添加图片失败: ${imgErr}`, 'error')
+          }
+        }
+
+        const xlsxBuffer = await workbook.xlsx.writeBuffer()
+        const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        link.download = `${tableName}_${new Date().toISOString().slice(0, 10)}.xlsx`
+        link.click()
+        URL.revokeObjectURL(url)
+        fileName = `${tableName}_${new Date().toISOString().slice(0, 10)}.xlsx`
+      }
 
       addLog(`导出成功: ${fileName}`, 'success')
       setStatusMsg(`导出成功！已导出 ${recordCount} 条记录，${selectedFieldIds.length} 个字段`)
@@ -273,28 +465,37 @@ function App() {
 
       <div className="card">
         <h3>📥 导出数据</h3>
-        <p className="desc">选择字段，导出为 CSV 或 JSON 格式</p>
+        <p className="desc">选择字段，导出为 CSV、JSON 或 Excel 格式（Excel格式支持附件图片嵌入单元格）</p>
         
         <div className="form-group">
           <label>导出格式</label>
           <div className="radio-group">
             <label>
-              <input 
-                type="radio" 
-                name="format" 
+              <input
+                type="radio"
+                name="format"
                 checked={exportFormat === 'csv'}
                 onChange={() => setExportFormat('csv')}
               />
               CSV (Excel)
             </label>
             <label>
-              <input 
-                type="radio" 
-                name="format" 
+              <input
+                type="radio"
+                name="format"
                 checked={exportFormat === 'json'}
                 onChange={() => setExportFormat('json')}
               />
               JSON
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="format"
+                checked={exportFormat === 'xlsx'}
+                onChange={() => setExportFormat('xlsx')}
+              />
+              Excel (附件图片嵌入单元格)
             </label>
           </div>
         </div>
@@ -357,8 +558,8 @@ function App() {
       </div>
 
       <p className="footer">
-        山东代理区-数据运营开发<br/>
-        有问题联系裴忠瀚
+        飞行社-裴忠瀚开发<br/>
+        vx 15650021709
       </p>
     </div>
   )
