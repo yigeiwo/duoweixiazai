@@ -543,8 +543,8 @@ function App() {
       </div>
 
       <p className="footer">
-        山东代理区-数据运营开发<br/>
-        有问题联系裴忠瀚
+        飞行社-裴忠瀚开发<br/>
+        vx 15650021709
       </p>
     </div>
   )
